@@ -29,6 +29,7 @@ MOVE_FILE_PATTERNS=(
     "io_time_data.dat"
     "pre_time_data.dat"
     "fort.1"
+    "MFC.out"
 )
 
 # Directories/patterns to skip entirely (never archive)
