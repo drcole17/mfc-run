@@ -436,6 +436,8 @@ archive_directory() {
     if [[ $rc -eq 0 ]]; then
         # Remove the now-empty source directory tree
         find "$src" -type d -empty -delete 2>/dev/null || true
+        # Remove top-level dir if it's now empty (e.g. D/)
+        [[ -d "$src" ]] && rmdir "$src" 2>/dev/null || true
         success "  Done: ${dir_name}/"
     else
         warn "  rsync failed for ${dir_name}/ (exit ${rc}). Files may remain locally."
