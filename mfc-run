@@ -69,6 +69,9 @@ START_TIME=0
 END_TIME=0
 ARCHIVE_ONLY=false
 ARCHIVE_DIR=""
+CLUSTER_NAME=""
+CLUSTER_MODULES=""
+CLUSTER_CONF_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/mfc/clusters"
 
 # ─── Config file loading ───────────────────────────────────────────────────
 load_config() {
@@ -108,6 +111,163 @@ load_config() {
     done < "$config_file"
 }
 
+# ─── Cluster detection ─────────────────────────────────────────────────────
+detect_cluster() {
+    # Skip if --cluster already set CLUSTER_NAME
+    [[ -n "$CLUSTER_NAME" ]] && return 0
+
+    [[ -d "$CLUSTER_CONF_DIR" ]] || return 0
+
+    local fqdn
+    fqdn="$(hostname -f 2>/dev/null || hostname)"
+
+    for conf in "${CLUSTER_CONF_DIR}"/*.conf; do
+        [[ -f "$conf" ]] || continue
+
+        local patterns=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            line="${line%%#*}"
+            line="$(echo "$line" | xargs)"
+            [[ -z "$line" ]] && continue
+
+            local key="${line%%=*}"
+            local val="${line#*=}"
+            val="${val#\"}" ; val="${val%\"}"
+            val="${val#\'}" ; val="${val%\'}"
+
+            [[ "$key" == "HOSTNAME_PATTERNS" ]] && patterns="$val"
+        done < "$conf"
+
+        [[ -z "$patterns" ]] && continue
+
+        IFS=',' read -ra pats <<< "$patterns"
+        for pat in "${pats[@]}"; do
+            pat="$(echo "$pat" | xargs)"
+            # shellcheck disable=SC2254
+            if [[ "$fqdn" == $pat ]]; then
+                CLUSTER_NAME="$(basename "$conf" .conf)"
+                return 0
+            fi
+        done
+    done
+}
+
+# ─── Module loading ────────────────────────────────────────────────────────
+load_modules() {
+    local modules="$1"
+    [[ -z "$modules" ]] && return 0
+
+    # Temporarily relax strict mode — module implementations are fragile
+    set +eu
+
+    # Ensure the module function is available
+    if ! type module &>/dev/null; then
+        for init in /etc/profile.d/modules.sh \
+                    /etc/profile.d/z00_lmod.sh \
+                    /usr/share/lmod/lmod/init/bash \
+                    /usr/share/modules/init/bash \
+                    /opt/modules/init/bash; do
+            if [[ -f "$init" ]]; then
+                # shellcheck disable=SC1090
+                source "$init"
+                break
+            fi
+        done
+    fi
+
+    if ! type module &>/dev/null; then
+        set -eu
+        warn "module command not available — skipping module loads"
+        return 0
+    fi
+
+    for mod in $modules; do
+        info "  Loading module: ${mod}"
+        module load "$mod"
+    done
+
+    set -eu
+}
+
+# ─── Export scheduler variables ────────────────────────────────────────────
+export_scheduler_vars() {
+    local scheduler="$1"
+    local account="$2"
+    local partition="$3"
+
+    case "$scheduler" in
+        slurm)
+            [[ -n "$account" ]]   && export SLURM_ACCOUNT="$account"
+            [[ -n "$partition" ]]  && export SLURM_PARTITION="$partition"
+            ;;
+        pbs)
+            [[ -n "$account" ]]   && export PBS_ACCOUNT="$account"
+            [[ -n "$partition" ]]  && export PBS_QUEUE="$partition"
+            ;;
+        lsf)
+            [[ -n "$account" ]]   && export LSF_PROJECT="$account"
+            [[ -n "$partition" ]]  && export BSUB_QUEUE="$partition"
+            ;;
+        "")
+            ;;
+        *)
+            warn "Unknown scheduler type: ${scheduler}"
+            ;;
+    esac
+}
+
+# ─── Load cluster profile ─────────────────────────────────────────────────
+load_cluster_profile() {
+    [[ -z "$CLUSTER_NAME" ]] && return 0
+
+    local conf_file="${CLUSTER_CONF_DIR}/${CLUSTER_NAME}.conf"
+    if [[ ! -f "$conf_file" ]]; then
+        error "Cluster profile not found: ${conf_file}"
+        exit 1
+    fi
+
+    local cl_modules="" cl_scheduler="" cl_account="" cl_partition=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        line="${line%%#*}"
+        line="$(echo "$line" | xargs)"
+        [[ -z "$line" ]] && continue
+
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        val="${val#\"}" ; val="${val%\"}"
+        val="${val#\'}" ; val="${val%\'}"
+
+        case "$key" in
+            MFC_ROOT)
+                [[ -z "${MFC_ROOT:-}" ]] && MFC_ROOT="$val"
+                ;;
+            ARCHIVE_BASE)
+                if [[ "${ARCHIVE_BASE}" == "${HOME}/.local/share/mfc/runs" ]]; then
+                    ARCHIVE_BASE="$val"
+                fi
+                ;;
+            MODULES)         cl_modules="$val" ;;
+            SCHEDULER)       cl_scheduler="$val" ;;
+            ACCOUNT)         cl_account="$val" ;;
+            PARTITION)       cl_partition="$val" ;;
+            HOSTNAME_PATTERNS) ;;  # used by detect_cluster, skip
+            *)
+                warn "Unknown key in cluster profile ${CLUSTER_NAME}: ${key}"
+                ;;
+        esac
+    done < "$conf_file"
+
+    CLUSTER_MODULES="$cl_modules"
+
+    info "Cluster profile loaded: ${BOLD}${CLUSTER_NAME}${RESET}"
+
+    load_modules "$cl_modules"
+    export_scheduler_vars "$cl_scheduler" "$cl_account" "$cl_partition"
+}
+
 # ─── Auto-detect MFC root ──────────────────────────────────────────────────
 detect_mfc_root() {
     # If MFC_ROOT is already set and valid, nothing to do
@@ -135,6 +295,7 @@ usage() {
     cat <<EOF
 Usage:
   mfc-run <case_path> [mfc_flags...]        Run simulation and archive results
+  mfc-run --cluster <name> <case_path> [mfc_flags...]  Use a specific cluster profile
   mfc-run --archive-only <case_path> [flags...]  Archive existing output (skip mfc.sh)
   mfc-run --list-runs <case_name>           List archived runs for a case
   mfc-run --help                            Show this help
@@ -143,9 +304,13 @@ Arguments:
   case_path     Path to case.py (or its parent directory)
   mfc_flags     All remaining flags are passed through to ./mfc.sh run
 
+Options:
+  --cluster <name>   Use the named cluster profile (overrides auto-detection)
+
 Examples:
   mfc-run examples/2D_recovering_ellipse/case.py -n 24 --gpu --clean
   mfc-run examples/2D_recovering_ellipse -n 2 --clean
+  mfc-run --cluster phoenix examples/2D_recovering_ellipse/case.py -n 24 --gpu
   mfc-run --archive-only examples/2D_recovering_ellipse/case.py
   mfc-run --list-runs 2D_recovering_ellipse
 
@@ -162,7 +327,22 @@ Configuration:
     MFC_ROOT=/path/to/MFC
     ARCHIVE_BASE=/path/to/archive
 
-  Precedence: env vars > config file > auto-detect/defaults
+  Precedence: env vars > cluster profile > config file > auto-detect/defaults
+
+Cluster profiles:
+  Directory: \${XDG_CONFIG_HOME:-~/.config}/mfc/clusters/
+  Auto-detection: hostname is matched against HOSTNAME_PATTERNS in each profile.
+  Override: use --cluster <name> to select a profile manually.
+
+  Example profile (~/.config/mfc/clusters/phoenix.conf):
+    # Hostname patterns for auto-detection (comma-separated globs)
+    HOSTNAME_PATTERNS=*.pace.gatech.edu,login-phoenix-*
+    SCHEDULER=slurm
+    ACCOUNT=my_allocation
+    PARTITION=gpu
+    MODULES=gcc/12 cuda/12.2 openmpi/4.1
+    MFC_ROOT=/storage/home/user/MFC
+    ARCHIVE_BASE=/scratch/user/mfc-runs
 EOF
 }
 
@@ -244,6 +424,31 @@ list_runs() {
 
 # ─── Parse arguments ────────────────────────────────────────────────────────
 parse_args() {
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 0
+    fi
+
+    # Extract --cluster <name> before main parsing
+    local new_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cluster)
+                if [[ $# -lt 2 ]]; then
+                    error "Usage: mfc-run --cluster <name> ..."
+                    exit 1
+                fi
+                CLUSTER_NAME="$2"
+                shift 2
+                ;;
+            *)
+                new_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    set -- "${new_args[@]+"${new_args[@]}"}"
+
     if [[ $# -eq 0 ]]; then
         usage
         exit 0
@@ -336,6 +541,9 @@ prompt_description() {
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
     echo "  ${BOLD}MFC Run: ${CYAN}${CASE_NAME}${RESET}"
+    if [[ -n "$CLUSTER_NAME" ]]; then
+        echo "  ${BOLD}Cluster: ${CYAN}${CLUSTER_NAME}${RESET}"
+    fi
     echo "  ${DIM}Command: ./mfc.sh run ${CASE_PATH} ${MFC_FLAGS[*]:-}${RESET}"
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
@@ -476,6 +684,8 @@ data = {
     'case_py_sha256': sys.argv[9],
     'mfc_git_hash': sys.argv[10],
     'hostname': os.uname().nodename,
+    'cluster': sys.argv[13] if sys.argv[13] else 'local',
+    'modules_loaded': sys.argv[14].split() if sys.argv[14] else [],
 }
 
 # Include key simulation parameters if available
@@ -492,7 +702,8 @@ with open(sys.argv[12], 'w') as f:
     f.write('\n')
 " "$CASE_NAME" "$TIMESTAMP" "$RUN_DESCRIPTION" "$RUN_STATUS" \
   "$MFC_EXIT_CODE" "$duration" "$CASE_PATH" "$flags_json" \
-  "$CASE_SHA256" "$mfc_git_hash" "$CASE_JSON" "$metadata_path"
+  "$CASE_SHA256" "$mfc_git_hash" "$CASE_JSON" "$metadata_path" \
+  "$CLUSTER_NAME" "${CLUSTER_MODULES:-}"
 }
 
 # ─── Archive results ───────────────────────────────────────────────────────
@@ -606,6 +817,8 @@ print_summary() {
 main() {
     load_config
     parse_args "$@"
+    detect_cluster
+    load_cluster_profile
     validate_environment
     prompt_description
     snapshot_case_params
