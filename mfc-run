@@ -564,10 +564,89 @@ snapshot_case_params() {
     fi
 }
 
+# ─── Batch mode detection ─────────────────────────────────────────────────
+is_batch_mode() {
+    local prev=""
+    for arg in "${MFC_FLAGS[@]}"; do
+        if [[ "$prev" == "-e" || "$prev" == "--engine" ]] && [[ "$arg" == "batch" ]]; then
+            return 0
+        fi
+        prev="$arg"
+    done
+    return 1
+}
+
+# ─── SLURM job polling ───────────────────────────────────────────────────
+SLURM_JOB_ID=""
+
+wait_for_slurm_job() {
+    local job_id="$1"
+    local poll_interval=30
+
+    info "Waiting for SLURM job ${BOLD}${job_id}${RESET} to complete (polling every ${poll_interval}s)..."
+    echo ""
+
+    while true; do
+        # sacct gives the most reliable status, including after job finishes
+        local state
+        state="$(sacct -j "$job_id" -n -o State -X 2>/dev/null | xargs)" || true
+
+        if [[ -z "$state" ]]; then
+            # Fallback to squeue if sacct is not available or job too new
+            if squeue -j "$job_id" &>/dev/null; then
+                state="$(squeue -j "$job_id" -h -o '%T' 2>/dev/null | head -1)" || true
+                [[ -z "$state" ]] && state="COMPLETED"  # Job no longer in queue
+            else
+                warn "Cannot query job status. Assuming completed."
+                state="COMPLETED"
+            fi
+        fi
+
+        case "$state" in
+            COMPLETED)
+                success "SLURM job ${job_id} completed."
+                MFC_EXIT_CODE=0
+                return 0
+                ;;
+            FAILED|NODE_FAIL|OUT_OF_MEMORY)
+                warn "SLURM job ${job_id} ${state}."
+                MFC_EXIT_CODE=1
+                return 0
+                ;;
+            CANCELLED|CANCELLED+|TIMEOUT|PREEMPTED|DEADLINE)
+                warn "SLURM job ${job_id} ${state}."
+                MFC_EXIT_CODE=1
+                return 0
+                ;;
+            PENDING|RUNNING|CONFIGURING|COMPLETING|REQUEUED|RESIZING|SUSPENDED)
+                printf "\r  ${DIM}[%s] Job %s: %s${RESET}  " "$(date +%H:%M:%S)" "$job_id" "$state"
+                sleep "$poll_interval"
+                ;;
+            *)
+                # Unknown state — keep waiting but warn
+                printf "\r  ${DIM}[%s] Job %s: %s (unknown state)${RESET}  " "$(date +%H:%M:%S)" "$job_id" "$state"
+                sleep "$poll_interval"
+                ;;
+        esac
+    done
+}
+
+# Extract SLURM job ID from sbatch output (e.g. "Submitted batch job 12345")
+extract_slurm_job_id() {
+    local output="$1"
+    local job_id
+    job_id="$(echo "$output" | grep -oP 'Submitted batch job \K[0-9]+' | tail -1)" || true
+    echo "$job_id"
+}
+
 # ─── Run simulation ────────────────────────────────────────────────────────
 handle_interrupt() {
     echo ""
-    if [[ -n "$MFC_PID" ]]; then
+    if [[ -n "$SLURM_JOB_ID" ]]; then
+        warn "Interrupted. Cancelling SLURM job ${SLURM_JOB_ID}..."
+        scancel "$SLURM_JOB_ID" 2>/dev/null || true
+        SLURM_JOB_ID=""
+    elif [[ -n "$MFC_PID" ]]; then
         warn "Interrupted. Sending SIGTERM to MFC (PID $MFC_PID)..."
         kill -TERM "$MFC_PID" 2>/dev/null || true
         wait "$MFC_PID" 2>/dev/null || true
@@ -595,13 +674,87 @@ run_simulation() {
     echo ""
 
     cd "$MFC_ROOT"
-    set +e
-    ./mfc.sh run "$CASE_PATH" "${MFC_FLAGS[@]}" &
-    MFC_PID=$!
-    wait $MFC_PID
-    MFC_EXIT_CODE=$?
-    MFC_PID=""
-    set -e
+
+    if is_batch_mode; then
+        # Batch mode: capture sbatch output to extract job ID
+        local submit_output
+        set +e
+        submit_output="$(./mfc.sh run "$CASE_PATH" "${MFC_FLAGS[@]}" 2>&1 | tee /dev/stderr)"
+        local submit_code=$?
+        set -e
+
+        if [[ $submit_code -ne 0 ]]; then
+            MFC_EXIT_CODE=$submit_code
+            END_TIME=$(date +%s)
+            trap - INT TERM
+            echo ""
+            RUN_STATUS="FAILED"
+            warn "Job submission failed with exit code ${submit_code}."
+            return
+        fi
+
+        SLURM_JOB_ID="$(extract_slurm_job_id "$submit_output")"
+
+        if [[ -z "$SLURM_JOB_ID" ]]; then
+            warn "Could not extract SLURM job ID from submission output."
+            warn "Falling back to treating submission as completion."
+            MFC_EXIT_CODE=0
+            # Fall through to normal archive_results in main()
+        else
+            # Fork polling + archiving to background, return shell to user
+            local log_file="${CASE_DIR}/.mfc-run-${SLURM_JOB_ID}.log"
+            echo ""
+            info "Submitted SLURM job: ${BOLD}${SLURM_JOB_ID}${RESET}"
+            info "Polling in background. Log: ${CYAN}${log_file}${RESET}"
+            info "Check status:  ${DIM}tail -f ${log_file}${RESET}"
+            info "Cancel:        ${DIM}scancel ${SLURM_JOB_ID}${RESET}"
+            echo ""
+
+            (
+                # Background subshell: poll, then archive
+                exec > "$log_file" 2>&1
+
+                # Strip colors in log output
+                BOLD="" GREEN="" RED="" YELLOW="" CYAN="" DIM="" RESET=""
+
+                echo "[mfc-run] Background monitor started at $(date)"
+                echo "[mfc-run] SLURM job: ${SLURM_JOB_ID}"
+                echo "[mfc-run] Case: ${CASE_NAME}"
+                echo "[mfc-run] Description: ${RUN_DESCRIPTION}"
+                echo ""
+
+                wait_for_slurm_job "$SLURM_JOB_ID"
+
+                END_TIME=$(date +%s)
+
+                echo ""
+                if [[ $MFC_EXIT_CODE -eq 0 ]]; then
+                    RUN_STATUS="SUCCESS"
+                    echo "[mfc-run] Simulation completed successfully."
+                else
+                    RUN_STATUS="FAILED"
+                    echo "[mfc-run] Simulation exited with code ${MFC_EXIT_CODE}."
+                fi
+
+                echo "[mfc-run] Archiving results..."
+                archive_results
+                echo "[mfc-run] Done at $(date)"
+            ) &
+            disown
+
+            # Exit main process — background handles the rest
+            exit 0
+        fi
+    else
+        # Interactive mode: run directly and wait
+        set +e
+        ./mfc.sh run "$CASE_PATH" "${MFC_FLAGS[@]}" &
+        MFC_PID=$!
+        wait $MFC_PID
+        MFC_EXIT_CODE=$?
+        MFC_PID=""
+        set -e
+    fi
 
     END_TIME=$(date +%s)
 
