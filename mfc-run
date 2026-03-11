@@ -306,6 +306,7 @@ Arguments:
 
 Options:
   --cluster <name>   Use the named cluster profile (overrides auto-detection)
+  -m, --description <text>  Run description (skips interactive prompt)
 
 Examples:
   mfc-run examples/2D_recovering_ellipse/case.py -n 24 --gpu --clean
@@ -429,7 +430,7 @@ parse_args() {
         exit 0
     fi
 
-    # Extract --cluster <name> before main parsing
+    # Extract --cluster and --description before main parsing
     local new_args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -439,6 +440,14 @@ parse_args() {
                     exit 1
                 fi
                 CLUSTER_NAME="$2"
+                shift 2
+                ;;
+            -m|--description)
+                if [[ $# -lt 2 ]]; then
+                    error "Usage: mfc-run --description <text> ..."
+                    exit 1
+                fi
+                RUN_DESCRIPTION="$2"
                 shift 2
                 ;;
             *)
@@ -547,8 +556,14 @@ prompt_description() {
     echo "  ${DIM}Command: ./mfc.sh run ${CASE_PATH} ${MFC_FLAGS[*]:-}${RESET}"
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
-    read -rp "  Enter a short description for this run: " RUN_DESCRIPTION
-    RUN_DESCRIPTION="${RUN_DESCRIPTION:-(no description)}"
+    if [[ -n "$RUN_DESCRIPTION" ]]; then
+        info "Description: ${RUN_DESCRIPTION}"
+    elif [[ -t 0 ]]; then
+        read -rp "  Enter a short description for this run: " RUN_DESCRIPTION
+        RUN_DESCRIPTION="${RUN_DESCRIPTION:-(no description)}"
+    else
+        RUN_DESCRIPTION="(no description)"
+    fi
     echo ""
 }
 
